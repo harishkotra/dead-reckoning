@@ -1,0 +1,13 @@
+// Server workspace TypeScript configuration.
+// Compiles the gRPC server, the journal, the LLM wrapper, and the bridge.
+// The generated proto types (server/generated) are emitted by ts-proto.
+
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "generated/**/*.ts"]
+}

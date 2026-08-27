@@ -1,0 +1,19 @@
+// Benchmark workspace TypeScript configuration. The benchmark drives the real
+// Dead Reckoning gRPC server, so it type-checks against the server sources it
+// imports (handler, journal, generated proto types) in addition to its own.
+
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "..",
+    "types": ["node"]
+  },
+  "include": [
+    "src/**/*.ts",
+    "../server/src/handler.ts",
+    "../server/src/journal.ts",
+    "../server/src/llm.ts",
+    "../server/generated/**/*.ts"
+  ]
+}

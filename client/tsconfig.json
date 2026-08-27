@@ -1,0 +1,12 @@
+// Client workspace TypeScript configuration. Compiles the standalone gRPC CLI
+// client used for terminal testing of resumption.
+
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "generated/**/*.ts"]
+}

@@ -1,0 +1,39 @@
+{
+  "name": "dead-reckoning-grpc",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Resumable gRPC server-streaming for LLM inference — reference implementation with a thin protocol layer on top of standard gRPC.",
+  "type": "module",
+  "workspaces": [
+    "server",
+    "client",
+    "web",
+    "benchmark"
+  ],
+  "scripts": {
+    "proto:gen": "mkdir -p server/generated client/generated && protoc --plugin=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=./server/generated --ts_proto_opt=esModuleInterop=true,useOptionals=messages --proto_path=./proto ./proto/inference.proto && protoc --plugin=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=./client/generated --ts_proto_opt=esModuleInterop=true,useOptionals=messages --proto_path=./proto ./proto/inference.proto",
+    "dev": "concurrently -k -n server,bridge,web -c blue,magenta,green \"npm run dev:server\" \"npm run dev:bridge\" \"npm run dev:web\"",
+    "dev:server": "npm run dev --workspace=server",
+    "dev:bridge": "npm run dev --workspace=server -- --bridge",
+    "dev:web": "npm run dev --workspace=web",
+    "bench": "npm run bench --workspace=benchmark --",
+    "build": "npm run build --workspace=server && npm run build --workspace=client && npm run build --workspace=web",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@bufbuild/protobuf": "^2.2.2",
+    "@types/node": "^22.10.0",
+    "concurrently": "^9.1.0",
+    "rxjs": "^7.8.1",
+    "ts-proto": "^2.6.1",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "protobufjs@7.6.5": true,
+    "esbuild@0.25.12": true
+  }
+}

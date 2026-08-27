@@ -1,0 +1,64 @@
+// inference.proto
+//
+// The protocol contract for resumable gRPC server-streaming LLM inference.
+// This schema is the thing being demonstrated: a thin, intentional protocol
+// layer on top of standard gRPC that makes dropped token streams resumable.
+//
+// The core idea encoded here: the client tracks a monotonically increasing
+// token_index (its "dead reckoning" position in the stream). When a stream
+// drops, the client reconnects and asks the server to resume from that index.
+// The server replays the already-generated tokens from its journal, then
+// continues streaming new tokens — so the client never sees a gap or a
+// duplicated token, and inference is never re-run.
+//
+// ACKs (added for the conference talk): during a long stream the client
+// periodically confirms its position with Ack(session_id, acked_token_index).
+// The server records the client's confirmed watermark and may TRIM journaled
+// tokens below it (the client no longer needs them), keeping memory bounded
+// for very long generations. acked_token_index semantics: the index of the
+// LAST token the client has fully received and rendered.
+
+syntax = "proto3";
+
+package inference;
+
+service InferenceService {
+  // Generate streams tokens for a prompt. If resume_from_token > 0 and the
+  // session exists in the server's journal, the stream starts by replaying
+  // already-generated tokens from that index onward, then continues with
+  // fresh tokens from the LLM. Otherwise a fresh inference is started.
+  rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+
+  // Ack records the client's confirmed watermark for a session. The server
+  // uses it to trim journaled tokens the client no longer needs and to answer
+  // state-recovery queries (a client that lost its local cursor can learn the
+  // last index it confirmed).
+  rpc Ack(AckRequest) returns (AckResponse);
+}
+
+message GenerateRequest {
+  string prompt = 1;
+  string session_id = 2;
+  int32 resume_from_token = 3;
+}
+
+message GenerateResponse {
+  string token = 1;
+  int32 token_index = 2;
+  bool is_final = 3;
+}
+
+message AckRequest {
+  string session_id = 1;
+  int32 acked_token_index = 2;
+}
+
+message AckResponse {
+  string session_id = 1;
+  // The server's confirmed watermark after applying this ACK.
+  int32 acked_token_index = 2;
+  // Number of journaled tokens still retained (post-trim) for this session.
+  int32 journaled_token_count = 3;
+  // Index of the first token still retained in the journal (0 if none).
+  int32 first_retained_index = 4;
+}

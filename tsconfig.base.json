@@ -1,0 +1,25 @@
+// Root TypeScript configuration for the Dead Reckoning monorepo.
+// Each workspace (server, client, web) extends this base. Strict mode is on
+// everywhere; the project intentionally bans `any` so the protocol logic stays
+// fully type-checked end to end.
+
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "strict": true,
+    "noImplicitAny": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "sourceMap": true,
+    "noEmitOnError": true
+  }
+}

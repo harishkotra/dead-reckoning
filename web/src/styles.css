@@ -1,0 +1,368 @@
+/* web/src/styles.css
+ *
+ * Raw CSS for the Dead Reckoning UI. No framework, no preprocessor — plain
+ * stylesheets. The palette matches the spec: dark #0d1117 background, white
+ * monospace text, a blinking green cursor while streaming, a red cursor with
+ * faded text when dropped, and a yellow flash on replayed tokens after resume.
+ */
+
+:root {
+  --bg: #0d1117;
+  --panel-bg: #161b22;
+  --panel-border: #30363d;
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+  --green: #3fb950;
+  --red: #f85149;
+  --yellow: #d29922;
+  --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+.app-header h1 {
+  margin: 0 0 2px;
+  font-size: 20px;
+  letter-spacing: 0.5px;
+}
+
+.app-header .tagline {
+  margin: 0 0 12px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.panels {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+}
+
+.app-footer {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--panel-border);
+  color: var(--text-dim);
+  font-size: 12px;
+  text-align: center;
+}
+
+.app-footer a {
+  color: var(--text);
+  text-decoration: none;
+  border-bottom: 1px dotted var(--text-dim);
+}
+
+.app-footer a:hover {
+  color: var(--green);
+}
+
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* ---------- Left panel: TokenStream ---------- */
+
+.token-stream {
+  gap: 12px;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.session-label {
+  color: var(--text-dim);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stream-status {
+  font-size: 12px;
+  font-weight: bold;
+}
+
+.status-streaming {
+  color: var(--green);
+}
+.status-dropped {
+  color: var(--red);
+}
+.status-resumed {
+  color: var(--yellow);
+}
+.status-idle {
+  color: var(--text-dim);
+}
+
+.token-area {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  padding: 16px;
+  font-size: 15px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  transition: opacity 0.3s ease;
+}
+
+/* Dropped stream: text fades to 60% opacity. */
+.token-area.dropped {
+  opacity: 0.6;
+}
+
+.token-area .placeholder {
+  color: var(--text-dim);
+}
+
+.token-area .token {
+  color: var(--text);
+}
+
+/* Replayed tokens flash yellow briefly after a resume. */
+.token-area .token.flash {
+  color: var(--yellow);
+  transition: color 0.3s ease;
+}
+
+/* Blinking cursor: green while streaming, red when dropped. */
+.token-area .cursor {
+  display: inline-block;
+  width: 8px;
+  height: 1.1em;
+  vertical-align: text-bottom;
+  margin-left: 2px;
+  animation: blink 1s step-start infinite;
+}
+
+.token-area:not(.dropped) .cursor {
+  background: var(--green);
+}
+
+.token-area.dropped .cursor {
+  background: var(--red);
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+.controls {
+  display: flex;
+  gap: 10px;
+}
+
+.btn {
+  flex: 1;
+  padding: 10px 12px;
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: bold;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  background: var(--panel-bg);
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--text-dim);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-generate {
+  background: #1f6feb;
+  border-color: #1f6feb;
+}
+
+.btn-generate:hover:not(:disabled) {
+  background: #388bfd;
+}
+
+.btn-kill {
+  background: #a40e26;
+  border-color: #a40e26;
+}
+
+.btn-kill:hover:not(:disabled) {
+  background: #da3633;
+}
+
+.btn-resume {
+  background: #7d4c00;
+  border-color: #7d4c00;
+}
+
+.btn-resume:hover:not(:disabled) {
+  background: #a26b00;
+}
+
+.conn-status {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.conn-ok {
+  color: var(--green);
+  font-weight: bold;
+}
+
+.conn-bad {
+  color: var(--red);
+  font-weight: bold;
+}
+
+/* ---------- Right panel: JournalInspector ---------- */
+
+.journal-inspector h2 {
+  margin: 0 0 12px;
+  font-size: 16px;
+}
+
+.journal-inspector h3 {
+  margin: 16px 0 8px;
+  font-size: 13px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.fields {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.field {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--panel-border);
+  padding-bottom: 8px;
+}
+
+.field dt {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.field dd {
+  margin: 0;
+  font-size: 13px;
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+.badge {
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: bold;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.status-streaming {
+  color: var(--green);
+}
+.status-dropped {
+  color: var(--red);
+}
+.status-resumed {
+  color: var(--yellow);
+}
+.status-idle {
+  color: var(--text-dim);
+}
+
+.timeline {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1;
+}
+
+.timeline-event {
+  display: flex;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12px;
+  border-bottom: 1px dashed var(--panel-border);
+}
+
+.timeline-time {
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.timeline-label {
+  color: var(--text);
+}
+
+.timeline-empty {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+/* ---------- Responsive ---------- */
+
+@media (max-width: 860px) {
+  .panels {
+    grid-template-columns: 1fr;
+    overflow-y: auto;
+  }
+}
