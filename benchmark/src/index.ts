@@ -242,6 +242,61 @@ interface Row {
   receivedTokens: number;
   newInferenceTokens: number;
   inferenceSaved: number;
+  /** How many runs this row aggregates (median of each timing). */
+  runs: number;
+}
+
+/** Median of a numeric list (0 for an empty list). */
+function median(values: number[]): number {
+  if (values.length === 0) {
+    return 0;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? Math.round((sorted[mid - 1] + sorted[mid]) / 2) : sorted[mid];
+}
+
+/** Run the retry-vs-resume comparison for one drop point D, `runs` times. */
+async function runScenarioRepeated(
+  client: BenchClient,
+  journal: TokenJournal,
+  prompt: string,
+  drop: number,
+  gapMs: number,
+  scenarioTag: string,
+  runs: number,
+): Promise<Row[]> {
+  const collected: Row[] = [];
+  for (let i = 0; i < runs; i += 1) {
+    collected.push(...(await runScenario(client, journal, prompt, drop, gapMs, `${scenarioTag}-r${i}`)));
+  }
+  // Aggregate per strategy: median timings, median token counts. Medians (not
+  // means) because LLM latency has a long right tail and one 8s outlier should
+  // not become the number on the slide.
+  const byStrategy = new Map<string, Row[]>();
+  for (const row of collected) {
+    const bucket = byStrategy.get(row.strategy) ?? [];
+    bucket.push(row);
+    byStrategy.set(row.strategy, bucket);
+  }
+  const out: Row[] = [];
+  for (const strategy of ["retry", "resume"]) {
+    const bucket = byStrategy.get(strategy) ?? [];
+    if (bucket.length === 0) {
+      continue;
+    }
+    out.push({
+      drop,
+      strategy,
+      firstTokenMs: median(bucket.map((r) => r.firstTokenMs)),
+      totalMs: median(bucket.map((r) => r.totalMs)),
+      receivedTokens: median(bucket.map((r) => r.receivedTokens)),
+      newInferenceTokens: median(bucket.map((r) => r.newInferenceTokens)),
+      inferenceSaved: median(bucket.map((r) => r.inferenceSaved)),
+      runs: bucket.length,
+    });
+  }
+  return out;
 }
 
 /** Run the retry-vs-resume comparison for one drop point D. */
@@ -278,6 +333,7 @@ async function runScenario(
     receivedTokens: retryFirst + retrySecond.tokens,
     newInferenceTokens: retryNewInference,
     inferenceSaved: 0,
+    runs: 1,
   });
 
   // --- RESUME: drop at D, reconnect the SAME session from index D. ---
@@ -306,6 +362,7 @@ async function runScenario(
     receivedTokens: resumeFirst + resumeSecond.tokens,
     newInferenceTokens: resumeContinuation,
     inferenceSaved: retryNewInference - resumeContinuation,
+    runs: 1,
   });
 
   return rows;
@@ -342,10 +399,9 @@ async function main(): Promise<void> {
   const gapMs = Number.parseInt(process.env.BENCH_GAP_MS ?? "1000", 10);
 
   const journal = new TokenJournal(60_000);
-  const prompts = new Map<string, string>();
   const { service } = loadInferenceProto();
   const server = new grpc.Server();
-  server.addService(service, makeServiceImplementation(journal, prompts));
+  server.addService(service, makeServiceImplementation(journal));
   await new Promise<void>((resolve, reject) => {
     server.bindAsync(`127.0.0.1:${grpcPort}`, grpc.ServerCredentials.createInsecure(), (err) => {
       if (err) {
@@ -366,25 +422,35 @@ async function main(): Promise<void> {
   );
 
   const rows: Row[] = [];
+  const runs = Number.parseInt(process.env.BENCH_RUNS ?? "3", 10);
+  log(`each drop point is measured ${runs}x; timings below are medians`);
   for (const drop of drops) {
-    const scenarioRows = await runScenario(client, journal, prompt, drop, gapMs, `bench-${drop}`);
+    const scenarioRows = await runScenarioRepeated(
+      client,
+      journal,
+      prompt,
+      drop,
+      gapMs,
+      `bench-${drop}`,
+      runs,
+    );
     rows.push(...scenarioRows);
-    log(`drop after ${drop} tokens done`);
+    log(`drop after ${drop} tokens done (${runs} runs x retry+resume)`);
   }
 
   // Print the comparison table (markdown, for the README).
   const lines: string[] = [];
   lines.push(
-    "| drop after | strategy | reconnect→1st token | reconnect→complete | tokens received | new inference tokens | inference saved |",
+    "| drop after | strategy | reconnect→1st token | reconnect→complete | tokens received | new inference tokens | inference saved | runs |",
   );
   lines.push(
-    "|---|----------|-------------------|--------------------|-----------------|----------------------|-----------------|",
+    "|---|----------|-------------------|--------------------|-----------------|----------------------|-----------------|---|",
   );
   for (const row of rows) {
     lines.push(
       `| ${row.drop} | ${row.strategy} | ${row.firstTokenMs} ms | ${row.totalMs} ms | ` +
         `${row.receivedTokens} | ${row.newInferenceTokens} | ` +
-        `${row.inferenceSaved > 0 ? `−${row.inferenceSaved}` : "—"} |`,
+        `${row.inferenceSaved > 0 ? `${row.inferenceSaved} saved` : "—"} | ${row.runs} |`,
     );
   }
   const table = lines.join("\n");

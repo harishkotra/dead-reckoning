@@ -158,6 +158,9 @@ function run(options: CliOptions, address: string): Promise<void> {
     let lastIndex = options.resumeFrom - 1;
     let finalReceived = false;
     let acksSent = 0;
+    // Tokens recovered from the journal after this call attached (visible as
+    // dim text) versus tokens that came live off the model.
+    let replayedCount = 0;
 
     log(
       `calling Generate session="${options.sessionId}" resume_from=${options.resumeFrom} ` +
@@ -171,7 +174,7 @@ function run(options: CliOptions, address: string): Promise<void> {
 
     /** Send a periodic Ack for the current position, fire-and-forget. */
     const maybeAck = (): void => {
-      if (options.ackEvery <= 0 || lastIndex < 0) {
+      if (finalReceived || options.ackEvery <= 0 || lastIndex < 0) {
         return;
       }
       if ((lastIndex + 1) % options.ackEvery !== 0) {
@@ -188,6 +191,10 @@ function run(options: CliOptions, address: string): Promise<void> {
         })
         .catch((error: unknown) => {
           const message = error instanceof Error ? error.message : String(error);
+          // A late Ack racing the stream's close is expected noise, not a bug.
+          if (finalReceived || message.includes("UNAVAILABLE")) {
+            return;
+          }
           log(`ack #${acksSent} failed: ${message}`);
         });
     };
@@ -198,17 +205,32 @@ function run(options: CliOptions, address: string): Promise<void> {
         return;
       }
       lastIndex = response.tokenIndex;
-      process.stdout.write(response.token);
+      // Replayed tokens are printed dim so the terminal shows the seam between
+      // what the journal recovered and what the model produced live.
+      if (response.replayed) {
+        replayedCount += 1;
+        process.stdout.write(`\x1b[2m${response.token}\x1b[0m`);
+      } else {
+        process.stdout.write(response.token);
+      }
       maybeAck();
     });
 
-    stream.on("error", (error: Error) => {
+    stream.on("error", (error: grpc.ServiceError) => {
       // Stream dropped mid-generation. Report where we stopped — the next token
       // index (lastIndex + 1) is the resume point for the next call.
       log(`stream ERROR for session="${options.sessionId}": ${error.message}`);
+      if (error.code === grpc.status.FAILED_PRECONDITION) {
+        const first = error.metadata?.get("first-retained-index")?.[0] ?? "unknown";
+        log(
+          `cursor is below the journal window (first retained index ${first}); ` +
+            `resync required — a resume here would silently skip tokens`,
+        );
+      }
       log(
         `summary: session="${options.sessionId}" last_token_index=${lastIndex} ` +
-          `acks_sent=${acksSent} (resume with --resume-from ${lastIndex + 1})`,
+          `replayed=${replayedCount} acks_sent=${acksSent} ` +
+          `(resume with --resume-from ${lastIndex + 1})`,
       );
       client.close();
       resolve();
@@ -219,7 +241,8 @@ function run(options: CliOptions, address: string): Promise<void> {
       log(
         `stream END for session="${options.sessionId}": ` +
           `last_token_index=${lastIndex} final=${finalReceived ? "yes" : "no"} ` +
-          `acks_sent=${acksSent} (resume with --resume-from ${lastIndex + 1})`,
+          `replayed=${replayedCount} acks_sent=${acksSent} ` +
+          `(resume with --resume-from ${lastIndex + 1})`,
       );
       client.close();
       resolve();

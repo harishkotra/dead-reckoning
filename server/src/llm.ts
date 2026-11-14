@@ -41,17 +41,36 @@ export async function streamCompletion(
   config: LlmConfig,
   prompt: string,
   onToken: (token: string) => Promise<void>,
+  options: {
+    /** Text already generated; the model is asked to continue from it. */
+    continueFrom?: string;
+    /** Abort the upstream request (Cancel RPC). */
+    signal?: AbortSignal;
+  } = {},
 ): Promise<void> {
   const client = new OpenAI({
     baseURL: config.baseUrl,
     apiKey: config.apiKey,
   });
 
-  const stream = await client.chat.completions.create({
-    model: config.model,
-    messages: [{ role: "user", content: prompt }],
-    stream: true,
-  });
+  // Continuation (after a server restart) is deliberately implemented as a
+  // prompt-level hand-off, not a hidden state transfer: the model is shown what
+  // it already wrote and told to continue. That is exactly why naive resumption
+  // is unsafe — the continuation is coherent, but not bit-identical to the run
+  // that was interrupted. Same-session resumes never take this path: they
+  // attach to the still-running job.
+  const userContent = options.continueFrom
+    ? `${prompt}\n\nYou have already written the following. Continue from exactly where it stops. Do not repeat it, do not summarise it, do not start over:\n\n${options.continueFrom}`
+    : prompt;
+
+  const stream = await client.chat.completions.create(
+    {
+      model: config.model,
+      messages: [{ role: "user", content: userContent }],
+      stream: true,
+    },
+    { signal: options.signal },
+  );
 
   for await (const chunk of stream) {
     const delta = chunk.choices[0]?.delta?.content;

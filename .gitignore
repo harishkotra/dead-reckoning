@@ -71,3 +71,6 @@ coverage/
 .DS_Store
 
 docs/
+# SQLite journal written at runtime (see JOURNAL_DB)
+.journal.db
+.journal.db-journal

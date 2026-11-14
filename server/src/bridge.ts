@@ -8,12 +8,14 @@
 //   { type: "generate", prompt: string, session_id: string }
 //   { type: "resume", session_id: string, resume_from_token: number }
 //   { type: "ack", session_id: string, acked_token_index: number }
+//   { type: "cancel", session_id: string }
 //
 // Message protocol (bridge -> browser):
-//   { type: "token", token, token_index, is_final, session_id }
+//   { type: "token", token, token_index, is_final, replayed, session_id }
 //   { type: "journal_state", session_id, token_count }
 //   { type: "ack_state", session_id, acked_token_index, journaled_token_count, first_retained_index }
 //   { type: "stream_started" | "stream_resumed" | "stream_dropped", ... }
+//   { type: "resync_required", session_id, first_retained_index }
 //
 // The bridge creates a gRPC client per incoming message and forwards every
 // response token over the WebSocket. Browser `ack` messages are forwarded to
@@ -21,13 +23,19 @@
 // If the gRPC stream drops, the bridge logs it and keeps running — it never
 // crashes on a disconnected stream, and the session stays resumable via the
 // server's journal.
+//
+// A closed browser socket cancels only this bridge's gRPC CALL, never the
+// server-side generation job: the bridge is a listener, so a browser drop means
+// "nobody is listening right now", not "stop the model".
 
 import * as dotenv from "dotenv";
+import * as grpc from "@grpc/grpc-js";
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
 import { fileURLToPath } from "node:url";
 import { createInferenceClient, type InferenceClient } from "./handler.js";
 import type { GenerateRequest, GenerateResponse, AckRequest, AckResponse } from "../generated/inference.js";
+import type { ClientReadableStream } from "@grpc/grpc-js/build/src/call.js";
 
 dotenv.config({ path: fileURLToPath(new URL("../../.env", import.meta.url)) });
 
@@ -40,7 +48,8 @@ function log(message: string): void {
 type BridgeRequest =
   | { type: "generate"; prompt: string; session_id: string }
   | { type: "resume"; session_id: string; resume_from_token: number }
-  | { type: "ack"; session_id: string; acked_token_index: number };
+  | { type: "ack"; session_id: string; acked_token_index: number }
+  | { type: "cancel"; session_id: string };
 
 /** Create a gRPC client for the InferenceService (Generate + Ack). */
 function createGrpcClient(address: string): InferenceClient {
@@ -70,10 +79,12 @@ function forwardStream(
   request: GenerateRequest,
   socket: WebSocket,
   sessionId: string,
+  active: Set<ClientReadableStream<GenerateResponse>>,
 ): Promise<void> {
   return new Promise((resolve) => {
     const stream = client.Generate(request);
     let lastIndex = request.resumeFromToken;
+    active.add(stream);
 
     stream.on("data", (response: GenerateResponse) => {
       lastIndex = response.tokenIndex;
@@ -83,6 +94,7 @@ function forwardStream(
         token: response.token,
         token_index: response.tokenIndex,
         is_final: response.isFinal,
+        replayed: response.replayed,
         session_id: sessionId,
       });
       // Keep the browser's journal inspector in sync on every token.
@@ -93,23 +105,36 @@ function forwardStream(
       });
     });
 
-    stream.on("error", (error: Error) => {
-      // The gRPC stream dropped (or the upstream LLM failed). Log it and move
-      // on — the journal on the server already holds every token produced, so
-      // the session can be resumed later. This is the resilience this project
-      // demonstrates.
+    stream.on("error", (error: grpc.ServiceError) => {
+      active.delete(stream);
+      // The gRPC stream dropped (or the upstream LLM failed, or the cursor fell
+      // out of the journal window). Log it and move on — the journal on the
+      // server already holds every token produced, so the session can be
+      // resumed later.
       log(
-        `gRPC stream for session "${sessionId}" dropped at token ${lastIndex}: ${error.message}`,
+        `gRPC stream for session "${sessionId}" dropped at token ${lastIndex} ` +
+          `(code ${error.code ?? "?"}): ${error.message}`,
       );
-      sendToBrowser(socket, {
-        type: "stream_dropped",
-        session_id: sessionId,
-        last_token_index: lastIndex,
-      });
+      if (error.code === grpc.status.FAILED_PRECONDITION) {
+        // Never let the browser accept a silent gap: it must resync.
+        const first = error.metadata?.get("first-retained-index")?.[0];
+        sendToBrowser(socket, {
+          type: "resync_required",
+          session_id: sessionId,
+          first_retained_index: first ? Number(first) : -1,
+        });
+      } else {
+        sendToBrowser(socket, {
+          type: "stream_dropped",
+          session_id: sessionId,
+          last_token_index: lastIndex,
+        });
+      }
       resolve();
     });
 
     stream.on("end", () => {
+      active.delete(stream);
       log(`gRPC stream for session "${sessionId}" ended cleanly at token ${lastIndex}`);
       resolve();
     });
@@ -150,6 +175,7 @@ async function handleMessage(
   client: InferenceClient,
   socket: WebSocket,
   raw: string,
+  active: Set<ClientReadableStream<GenerateResponse>>,
 ): Promise<void> {
   let message: BridgeRequest;
   try {
@@ -176,6 +202,7 @@ async function handleMessage(
       { prompt, sessionId, resumeFromToken: 0 },
       socket,
       sessionId,
+      active,
     );
   } else if (message.type === "resume") {
     const { session_id: sessionId, resume_from_token: resumeFromToken } = message;
@@ -194,7 +221,30 @@ async function handleMessage(
       { prompt: "", sessionId, resumeFromToken },
       socket,
       sessionId,
+      active,
     );
+  } else if (message.type === "cancel") {
+    const { session_id: sessionId } = message;
+    if (!sessionId) {
+      log(`ignoring cancel message missing session_id`);
+      return;
+    }
+    try {
+      const response = await client.Cancel({ sessionId });
+      log(
+        `cancel session="${sessionId}" at token ${response.cancelledAtToken} ` +
+          `(was running: ${response.wasRunning})`,
+      );
+      sendToBrowser(socket, {
+        type: "cancelled",
+        session_id: sessionId,
+        cancelled_at_token: response.cancelledAtToken,
+        was_running: response.wasRunning,
+      });
+    } catch (error) {
+      const message2 = error instanceof Error ? error.message : String(error);
+      log(`cancel for session "${sessionId}" failed: ${message2}`);
+    }
   } else if (message.type === "ack") {
     const { session_id: sessionId, acked_token_index: ackedTokenIndex } = message;
     if (!sessionId || typeof ackedTokenIndex !== "number" || ackedTokenIndex < 0) {
@@ -229,12 +279,22 @@ export function startBridge(): void {
 
   wss.on("connection", (socket: WebSocket) => {
     log("browser connected");
+    // gRPC calls this socket is currently listening to. Closing the socket
+    // cancels the CALLS only — the server keeps generating and journaling, so
+    // the browser can reconnect and resume from the last token it saw. This is
+    // the single most important line in the demo: a dead browser must not be a
+    // cancelled inference.
+    const active = new Set<ClientReadableStream<GenerateResponse>>();
     socket.on("message", (data) => {
       const raw = data.toString();
-      void handleMessage(client, socket, raw);
+      void handleMessage(client, socket, raw, active);
     });
     socket.on("close", () => {
-      log("browser disconnected");
+      log(`browser disconnected (cancelling ${active.size} call(s); generation continues)`);
+      for (const stream of active) {
+        stream.cancel();
+      }
+      active.clear();
     });
     socket.on("error", (error: Error) => {
       // A client abruptly closing its socket (the "Kill Stream" button) lands

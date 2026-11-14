@@ -2,28 +2,42 @@
 //
 // The protocol handlers shared by the gRPC server (server/index.ts) and the
 // browser bridge (server/bridge.ts). Both talk to the same InferenceService,
-// so the Generate/Ack logic, the proto loading, and the service definition
-// live here once.
+// so the Generate/Ack/Cancel logic, the proto loading, and the service
+// definition live here once.
 //
-// Generate implements the resumable-stream protocol:
-//   - fresh request  -> journal + stream every token, is_final on the last
-//   - resume request -> replay journaled tokens with ORIGINAL indices, then
-//                       continue streaming fresh tokens from the LLM
-// Ack implements the periodic-ACK channel: it records the client's confirmed
-// watermark so the journal can trim tokens the client no longer needs.
+// Generate implements the resumable-stream protocol as ATTACH-TO-A-JOB:
+//   - session unknown          -> start a generation job, stream from token 0
+//   - job still running        -> replay the journal from the cursor, then
+//                                 follow the SAME run live (no second model call)
+//   - cursor below the window  -> FAILED_PRECONDITION + metadata, never a silent gap
+//   - run already completed    -> replay to the end and finish; no model call
+//   - run unfinished, no job   -> the process that owned it died: continue from
+//                                 the journal tail (non-deterministic by nature)
+//
+// A dropped call is a DETACH. Only Cancel ends generation.
 
 import * as grpc from "@grpc/grpc-js";
 import * as protoLoader from "@grpc/proto-loader";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { TokenJournal } from "./journal.js";
-import { loadLlmConfig, streamCompletion } from "./llm.js";
-import type { GenerateRequest, GenerateResponse, AckRequest, AckResponse } from "../generated/inference.js";
+import { GenerationJob } from "./job.js";
+import type {
+  GenerateRequest,
+  GenerateResponse,
+  AckRequest,
+  AckResponse,
+  CancelRequest,
+  CancelResponse,
+} from "../generated/inference.js";
 import type { ServerWritableStream, handleUnaryCall } from "@grpc/grpc-js/build/src/server-call.js";
 import type { ClientReadableStream } from "@grpc/grpc-js/build/src/call.js";
 
 /** Path to the proto file, resolved from this module. */
 const PROTO_PATH = join(dirname(fileURLToPath(import.meta.url)), "../../proto/inference.proto");
+
+/** How much journal text a post-restart continuation is shown. */
+const CONTINUATION_TAIL_CHARS = 4000;
 
 /** Timestamp-prefixed stdout logger for protocol lifecycle events. */
 function log(message: string): void {
@@ -34,36 +48,41 @@ function log(message: string): void {
 export interface InferenceClient {
   Generate(request: GenerateRequest): ClientReadableStream<GenerateResponse>;
   Ack(request: AckRequest): Promise<AckResponse>;
+  Cancel(request: CancelRequest): Promise<CancelResponse>;
 }
 
 /** A typed client constructor produced by proto-loader. */
 type InferenceClientCtor = new (address: string, credentials: grpc.ChannelCredentials) => {
   Generate(request: GenerateRequest): ClientReadableStream<GenerateResponse>;
   Ack(request: AckRequest, callback: grpc.requestCallback<AckResponse>): grpc.ClientUnaryCall;
+  Cancel(request: CancelRequest, callback: grpc.requestCallback<CancelResponse>): grpc.ClientUnaryCall;
   close(): void;
 };
 
 /**
  * Create a gRPC client for the InferenceService and wrap the callback-based
- * Ack unary method into a promise, matching the InferenceClient surface.
+ * unary methods into promises, matching the InferenceClient surface.
  */
 export function createInferenceClient(address: string): InferenceClient & { close(): void } {
   const { clientCtor } = loadInferenceProto();
   const raw = new clientCtor(address, grpc.credentials.createInsecure());
-  return {
-    Generate: (request) => raw.Generate(request),
-    Ack: (request) =>
-      new Promise<AckResponse>((resolve, reject) => {
-        raw.Ack(request, (error, response) => {
+  const unary = <Req, Res>(method: (request: Req, cb: grpc.requestCallback<Res>) => grpc.ClientUnaryCall) =>
+    (request: Req): Promise<Res> =>
+      new Promise<Res>((resolve, reject) => {
+        method.call(raw, request, (error, response) => {
           if (error) {
             reject(error);
           } else if (!response) {
-            reject(new Error("Ack returned an empty response"));
+            reject(new Error("empty unary response"));
           } else {
             resolve(response);
           }
         });
-      }),
+      });
+  return {
+    Generate: (request) => raw.Generate(request),
+    Ack: unary<AckRequest, AckResponse>((request, cb) => raw.Ack(request, cb)),
+    Cancel: unary<CancelRequest, CancelResponse>((request, cb) => raw.Cancel(request, cb)),
     close: () => raw.close(),
   };
 }
@@ -85,8 +104,7 @@ export function loadInferenceProto(): {
   };
   const service = proto.inference.InferenceService.service;
   // proto-loader does not emit a client class; grpc.makeGenericClientConstructor
-  // builds one from the service definition, with the same method surface
-  // (Generate streaming + Ack unary, both callback-based).
+  // builds one from the service definition, with the same method surface.
   const clientCtor = grpc.makeGenericClientConstructor(
     service,
     "inference.InferenceService",
@@ -123,105 +141,164 @@ async function finish(
   call: ServerWritableStream<GenerateRequest, GenerateResponse>,
   finalIndex: number,
 ): Promise<void> {
-  await send(call, { token: "", tokenIndex: finalIndex, isFinal: true });
+  await send(call, { token: "", tokenIndex: finalIndex, isFinal: true, replayed: false });
   call.end();
 }
 
 /**
- * Replay every journaled token from `fromIndex` onward with its original
- * token_index. If the requested index has already been ACK-trimmed away, the
- * journal returns an empty window and replay is a no-op (the client only ever
- * resumes at or after its own confirmed watermark, so this cannot lose data).
+ * Attach one call to a generation job: replay the journal from the client's
+ * cursor, then follow the live run. Tokens produced during the replay are
+ * buffered, so nothing can slip through the gap between "read the journal" and
+ * "attach". Resolves when the job finishes or the call dies — in the latter
+ * case the job is left running, which is the entire point.
  */
-async function replayJournal(
+async function attachAndPump(
+  job: GenerationJob,
   journal: TokenJournal,
-  call: ServerWritableStream<GenerateRequest, GenerateResponse>,
   sessionId: string,
   fromIndex: number,
+  call: ServerWritableStream<GenerateRequest, GenerateResponse>,
 ): Promise<void> {
-  const tokens = journal.read(sessionId, fromIndex);
-  for (let i = 0; i < tokens.length; i += 1) {
-    // Replay with the ORIGINAL index, so the client's dead-reckoning cursor
-    // lands exactly where it was when the stream dropped.
-    await send(call, {
-      token: tokens[i],
-      tokenIndex: fromIndex + i,
-      isFinal: false,
+  const buffered: GenerateResponse[] = [];
+  let closed = false;
+  let live = false;
+  let onClosed: (() => void) | null = null;
+
+  const detachJob = job.attach((token, index) => {
+    if (closed) {
+      return;
+    }
+    const message: GenerateResponse = { token, tokenIndex: index, isFinal: false, replayed: false };
+    if (live) {
+      void send(call, message).catch(() => drop(message.tokenIndex));
+    } else {
+      buffered.push(message);
+    }
+  });
+
+  const drop = (index: number): void => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    detachJob();
+    onClosed?.();
+    log(`session "${sessionId}" call dropped at token ${index}; generation continues in the journal`);
+  };
+
+  try {
+    const replayed = journal.read(sessionId, fromIndex);
+    for (let i = 0; i < replayed.length && !closed; i += 1) {
+      try {
+        await send(call, { token: replayed[i], tokenIndex: fromIndex + i, isFinal: false, replayed: true });
+      } catch {
+        drop(fromIndex + i);
+      }
+    }
+    if (replayed.length > 0) {
+      log(`session "${sessionId}" replayed ${replayed.length} journaled token(s) from index ${fromIndex}`);
+    }
+    live = true;
+    for (const message of buffered.splice(0)) {
+      if (closed) {
+        return;
+      }
+      void send(call, message).catch(() => drop(message.tokenIndex));
+    }
+    if (closed || !job.running) {
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      const off = job.onDone(() => {
+        off();
+        resolve();
+      });
+      onClosed = () => {
+        off();
+        resolve();
+      };
     });
+    if (closed) {
+      return;
+    }
+    await finish(call, journal.lastIndex(sessionId));
+  } finally {
+    detachJob();
   }
 }
 
 /**
- * Run a fresh LLM inference, journaling and streaming every token. Resolves
- * with the index of the last token streamed (exclusive end of the journal).
- */
-async function streamFresh(
-  journal: TokenJournal,
-  call: ServerWritableStream<GenerateRequest, GenerateResponse>,
-  sessionId: string,
-  prompt: string,
-  startIndex: number,
-): Promise<number> {
-  const config = loadLlmConfig();
-  let index = startIndex;
-  await streamCompletion(config, prompt, async (token: string) => {
-    journal.write(sessionId, index, token);
-    await send(call, {
-      token,
-      tokenIndex: index,
-      isFinal: false,
-    });
-    index += 1;
-  });
-  return index;
-}
-
-/**
- * The Generate RPC handler. Decides between "resume from journal" and
- * "fresh inference" per the protocol, and streams the response.
- *
- * Note on prompts: the journal stores only tokens, so the original prompt is
- * kept in a parallel in-memory registry. A resume request that carries no
- * prompt (e.g. from the browser bridge, whose resume message has no prompt
- * field) falls back to the session's stored prompt so fresh inference can
- * continue after the replay.
+ * The Generate RPC handler. Attaches the caller to a session's generation job,
+ * replaying the journal from the client's cursor where possible.
  */
 function generateHandler(
   journal: TokenJournal,
-  prompts: Map<string, string>,
+  jobs: Map<string, GenerationJob>,
   call: ServerWritableStream<GenerateRequest, GenerateResponse>,
 ): void {
   const { prompt, sessionId, resumeFromToken } = call.request;
 
+  /** Start a job, register it, and mark the session final when the run ends. */
+  const startJob = (startIndex: number, effectivePrompt: string, continueFrom = ""): GenerationJob => {
+    const job = new GenerationJob(journal, sessionId, effectivePrompt, startIndex, continueFrom);
+    jobs.set(sessionId, job);
+    void job.run().finally(() => {
+      journal.markFinal(sessionId, journal.lastIndex(sessionId));
+      jobs.delete(sessionId);
+    });
+    return job;
+  };
+
   void (async () => {
     try {
-      if (resumeFromToken > 0 && journal.has(sessionId)) {
-        // The bridge's resume message has no prompt; use the stored one.
-        const storedPrompt = prompts.get(sessionId);
-        const effectivePrompt = prompt.length > 0 ? prompt : (storedPrompt ?? "");
-        const journaled = journal.count(sessionId);
-        log(
-          `session "${sessionId}" RESUMING from token ${resumeFromToken} ` +
-            `(journal retains ${journaled} tokens, last=${journal.lastIndex(sessionId)})`,
-        );
-        await replayJournal(journal, call, sessionId, resumeFromToken);
-        const replayed = Math.max(0, journal.lastIndex(sessionId) - resumeFromToken + 1);
-        log(`session "${sessionId}" replayed ${replayed} journaled tokens`);
-        const endIndex = await streamFresh(journal, call, sessionId, effectivePrompt, journal.lastIndex(sessionId) + 1);
-        await finish(call, endIndex);
-        log(`session "${sessionId}" completed after resume at token ${endIndex}`);
-      } else {
-        const reason = resumeFromToken > 0 ? "session not in journal" : "fresh request";
-        log(`session "${sessionId}" STARTING fresh inference (${reason})`);
-        prompts.set(sessionId, prompt);
-        const endIndex = await streamFresh(journal, call, sessionId, prompt, 0);
-        await finish(call, endIndex);
-        log(`session "${sessionId}" completed fresh at token ${endIndex}`);
+      const live = jobs.get(sessionId);
+      if (live?.running) {
+        log(`session "${sessionId}" ATTACH at token ${resumeFromToken} (journal head ${journal.lastIndex(sessionId)})`);
+        await attachAndPump(live, journal, sessionId, resumeFromToken, call);
+        return;
       }
+
+      if (!journal.has(sessionId)) {
+        log(`session "${sessionId}" START fresh inference from token 0`);
+        journal.setPrompt(sessionId, prompt);
+        await attachAndPump(startJob(0, prompt), journal, sessionId, 0, call);
+        return;
+      }
+
+      const first = journal.firstIndex(sessionId);
+      if (first >= 0 && resumeFromToken < first) {
+        // Never paper over a hole: tell the client to resync.
+        const metadata = new grpc.Metadata();
+        metadata.set("first-retained-index", String(first));
+        const error = Object.assign(
+          new Error(
+            `resume_from_token ${resumeFromToken} is below the retained window ` +
+              `(first retained index ${first}); resync required`,
+          ),
+          { code: grpc.status.FAILED_PRECONDITION, metadata },
+        );
+        log(`session "${sessionId}" REJECTED resume at ${resumeFromToken} (window starts at ${first})`);
+        call.destroy(error);
+        return;
+      }
+
+      const final = journal.finalIndex(sessionId);
+      if (final >= 0) {
+        log(`session "${sessionId}" replaying completed run to token ${final}`);
+        const tokens = journal.read(sessionId, resumeFromToken);
+        for (let i = 0; i < tokens.length; i += 1) {
+          await send(call, { token: tokens[i], tokenIndex: resumeFromToken + i, isFinal: false, replayed: true });
+        }
+        await finish(call, final);
+        return;
+      }
+
+      // Session on disk, no live job: the process that owned the run is gone.
+      const start = journal.lastIndex(sessionId) + 1;
+      log(`session "${sessionId}" CONTINUING after restart at token ${start} (continuation is not bit-identical)`);
+      const resumed = startJob(start, journal.prompt(sessionId) || prompt, journal.text(sessionId, CONTINUATION_TAIL_CHARS));
+      await attachAndPump(resumed, journal, sessionId, resumeFromToken, call);
     } catch (error) {
-      // A dropped client stream (the "Kill Stream" scenario) surfaces here as a
-      // write error. The journal already has every token produced so far, so
-      // the session can be resumed later — nothing is lost.
       const err = error instanceof Error ? error : new Error(String(error));
       log(`session "${sessionId}" stream ended with error: ${err.message}`);
       call.destroy(err);
@@ -254,18 +331,46 @@ function ackHandler(
 }
 
 /**
- * Build the full service implementation (Generate + Ack) bound to a journal
- * and prompt registry. The server registers this on its grpc.Server.
+ * The Cancel RPC handler. The only way to stop paying for generation.
  */
-export function makeServiceImplementation(
+function cancelHandler(
   journal: TokenJournal,
-  prompts: Map<string, string>,
-): {
+  jobs: Map<string, GenerationJob>,
+  call: grpc.ServerUnaryCall<CancelRequest, CancelResponse>,
+  callback: grpc.sendUnaryData<CancelResponse>,
+): void {
+  const { sessionId } = call.request;
+  const job = jobs.get(sessionId);
+  if (!job?.running) {
+    callback(null, {
+      sessionId,
+      cancelledAtToken: journal.lastIndex(sessionId),
+      wasRunning: false,
+    });
+    return;
+  }
+  job.cancel();
+  jobs.delete(sessionId);
+  journal.markFinal(sessionId, journal.lastIndex(sessionId));
+  const stoppedAt = journal.lastIndex(sessionId);
+  log(`session "${sessionId}" CANCELLED at token ${stoppedAt}`);
+  callback(null, { sessionId, cancelledAtToken: stoppedAt, wasRunning: true });
+}
+
+/**
+ * Build the full service implementation (Generate + Ack + Cancel) bound to a
+ * journal. The jobs map lives here: it is the set of generation runs this
+ * process currently owns, and it deliberately outlives any single call.
+ */
+export function makeServiceImplementation(journal: TokenJournal): {
   Generate: (call: ServerWritableStream<GenerateRequest, GenerateResponse>) => void;
   Ack: handleUnaryCall<AckRequest, AckResponse>;
+  Cancel: handleUnaryCall<CancelRequest, CancelResponse>;
 } {
+  const jobs = new Map<string, GenerationJob>();
   return {
-    Generate: (call) => generateHandler(journal, prompts, call),
+    Generate: (call) => generateHandler(journal, jobs, call),
     Ack: (call, callback) => ackHandler(journal, call, callback),
+    Cancel: (call, callback) => cancelHandler(journal, jobs, call, callback),
   };
 }

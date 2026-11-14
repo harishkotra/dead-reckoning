@@ -156,20 +156,25 @@ syntax = "proto3";
 package inference;
 
 service InferenceService {
+  // Attach to a session's generation. Starts one if the session is unknown.
   rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+  // Client watermark: advances and trims the journal.
   rpc Ack(AckRequest) returns (AckResponse);
+  // Explicitly stop a generation. Idempotent.
+  rpc Cancel(CancelRequest) returns (CancelResponse);
 }
 
 message GenerateRequest {
-  string prompt = 1;
-  string session_id = 2;
-  int32 resume_from_token = 3;
+  string prompt = 1;            // required only when the session is new
+  string session_id = 2;        // required
+  int32 resume_from_token = 3;  // first index the client has NOT received
 }
 
 message GenerateResponse {
   string token = 1;
   int32 token_index = 2;
   bool is_final = 3;
+  bool replayed = 4;            // true when served from the journal, not the model
 }
 
 message AckRequest {
@@ -183,6 +188,16 @@ message AckResponse {
   int32 journaled_token_count = 3;
   int32 first_retained_index = 4;
 }
+
+message CancelRequest {
+  string session_id = 1;
+}
+
+message CancelResponse {
+  string session_id = 1;
+  int32 cancelled_at_token = 2;
+  bool was_running = 3;
+}
 ```
 
 **The semantics are the design:**
@@ -192,10 +207,21 @@ message AckResponse {
 - `resume_from_token` says "give me tokens starting at this index" — the server
   replays journaled tokens from that index with their **original** indices, so
   the client's stream is gapless and de-duplicated.
+- `replayed` separates journal history from live model output. The CLI dims
+  replayed tokens, the UI flashes them, and the benchmark counts them — which is
+  how the demo shows the seam between "what already happened" and "what the model
+  is writing now".
 - `is_final` marks the end of a stream (the final marker carries the exclusive
   end index).
 - `Ack(session_id, acked_token_index)` lets the client confirm its watermark so
   the server can **trim** journaled tokens the client no longer needs.
+- **`Generate` is an attach, not a job submission.** A dropped stream is a
+  *detach*: the generation keeps running server-side and keeps journaling. Only
+  `Cancel` stops the model. This is what makes "kill the stream, resume, and the
+  text continues rather than restarting" true rather than a demo trick.
+- A cursor below the retained window fails with `FAILED_PRECONDITION` carrying
+  the first retained index in trailing metadata, so the client learns it must
+  resync instead of silently skipping tokens.
 
 TypeScript types are generated with `ts-proto` into `server/generated/` and
 `client/generated/`; `@grpc/grpc-js` handles the wire format.
@@ -204,111 +230,108 @@ TypeScript types are generated with `ts-proto` into `server/generated/` and
 
 ### 6.1 `server/journal.ts` — the token journal (the heart)
 
-A sliding-window in-memory store keyed by `session_id`, with TTL eviction and
-ACK-aware trimming:
+A sliding window per `session_id`, with ACK-aware trimming, TTL eviction, and a
+SQLite mirror so a server restart does not lose the story:
 
 ```ts
-interface JournalEntry {
-  tokens: string[];        // window; absolute index of tokens[i] = base_index + i
-  base_index: number;      // advances as ACK-trimming drops the head
-  acked_index: number;     // highest token the client confirmed via Ack
-  created_at: number;
-  last_accessed: number;   // drives TTL eviction
+interface SessionState {
+  tokens: string[];     // window; absolute index of tokens[i] = base_index + i
+  base_index: number;   // advances as ACK-trimming drops the head
+  acked_index: number;  // highest token the client confirmed via Ack
+  last_accessed: number;// drives TTL eviction
 }
 
 export class TokenJournal {
-  write(session_id: string, token_index: number, token: string): void {
-    // append a token; grow the window gaplessly
-  }
+  write(session_id: string, token_index: number, token: string): void
+  //   append; grow the window gaplessly; mirror the row into SQLite
 
-  read(session_id: string, from_index: number): string[] {
-    // return every token from from_index onward (absolute indices)
-  }
+  read(session_id: string, from_index: number): string[] | null
+  //   null when from_index < base_index — the cursor points into a trimmed
+  //   hole, which the handler turns into FAILED_PRECONDITION
 
-  ack(session_id: string, acked_index: number): AckState | null {
-    // record the confirmed watermark and TRIM tokens at-or-below it
-  }
+  ack(session_id: string, acked_index: number): AckState | null
+  //   record the watermark and TRIM tokens at-or-below it
 
-  evict(): void {
-    // TTL cleanup, swept every 60s
-  }
+  evict(): void  //  TTL sweep, every 60s
 }
 ```
+
+**Sizing the TTL** (the talk's slide): `JOURNAL_TTL_MS` must exceed the longest
+plausible client outage — a phone switching networks, a proxy hiccup, a laptop
+waking — while staying short enough that idle sessions do not hold tokens
+forever. Tokens held cost memory (and, if mirrored, disk); tokens evicted
+convert a resume into a re-generation. Ten minutes is the demo default; it is a
+cost decision, not a protocol constant.
 
 The journal **never re-runs the LLM** — it only stores and replays tokens that
 were already generated. That is the whole point of the demo.
 
-### 6.2 `server/handler.ts` — the Generate + Ack handlers
+### 6.2 `server/job.ts` — the generation owns the stream
 
-Shared by the gRPC server and the bridge. The `Generate` handler decides
-between "resume from journal" and "fresh inference":
+The single most important structural fix in this design. Before, the gRPC call
+*drove* the LLM call, so a dropped client either stopped generation or (worse)
+left a second writer appending to the same session — which is how you get a
+journal that reads `25 → 176 → 185` with a hole at 176.
+
+Now `GenerationJob` owns the model call. `Generate` attaches a sink to it:
 
 ```ts
-function generateHandler(journal, prompts, call): void {
-  const { prompt, sessionId, resumeFromToken } = call.request;
-
-  if (resumeFromToken > 0 && journal.has(sessionId)) {
-    // 1. Replay journaled tokens from resumeFromToken with ORIGINAL indices.
-    await replayJournal(journal, call, sessionId, resumeFromToken);
-    // 2. Continue streaming fresh tokens from the LLM at lastIndex + 1.
-    const endIndex = await streamFresh(
-      journal, call, sessionId, effectivePrompt, journal.lastIndex(sessionId) + 1,
-    );
-    await finish(call, endIndex);
-  } else {
-    // Fresh inference: journal every token as it arrives.
-    prompts.set(sessionId, prompt);
-    const endIndex = await streamFresh(journal, call, sessionId, prompt, 0);
-    await finish(call, endIndex);
-  }
+class GenerationJob {
+  attach(sink: Sink): void    // one live follower per session (the demo's shape)
+  detach(sink: Sink): void    // client dropped: keep generating, keep journaling
+  cancel(): void              // explicit Cancel RPC: abort the upstream call
 }
 ```
 
-The `Ack` handler records the watermark and trims:
+Consequences worth saying out loud in the talk:
+
+- A dropped stream no longer corrupts the journal, because there is exactly one
+  writer per session.
+- "Kill Stream" in the UI is a *detach*. If you watch the server logs, the model
+  finishes the sentence while nobody is connected — and the reconnect replays
+  exactly those tokens.
+- Two bugs the old design hid: resume used to re-run the model from scratch
+  (the journal was a transcript, not a checkpoint), and the "inference saved"
+  number was therefore sometimes negative. Both are gone.
+
+### 6.3 `server/handler.ts` — Generate as attach, plus Ack and Cancel
+
+One protocol layer shared by the gRPC server and the bridge:
 
 ```ts
-function ackHandler(journal, call, callback): void {
-  const state = journal.ack(call.request.sessionId, call.request.ackedTokenIndex);
-  if (!state) {
-    callback({ code: grpc.status.NOT_FOUND, message: `session not in journal` });
-    return;
-  }
-  callback(null, {
-    sessionId: call.request.sessionId,
-    ackedTokenIndex: state.acked_index,
-    journaledTokenCount: state.journaled_token_count,
-    firstRetainedIndex: state.first_retained_index,
-  });
+generate(call) {
+  const { sessionId, resumeFromToken, prompt } = call.request;
+  // unknown session        → start a job, attach at index 0
+  // running job            → replay journal[cursor..head], then follow live
+  // completed job          → replay journal[cursor..end], then is_final
+  // cursor below window    → FAILED_PRECONDITION + first_retained_index metadata
+  // finished, job evicted  → continue from the journal tail (see llm.ts caveat)
 }
 ```
 
-### 6.3 `server/llm.ts` — the OpenAI-compatible wrapper
-
-A thin adapter: read `.env`, call the streaming endpoint, invoke `onToken` for
-every non-empty delta. It has no knowledge of sessions or journals — the gRPC
-server layers resumability on top.
+### 6.4 `server/llm.ts` — the OpenAI-compatible wrapper
 
 ```ts
 export async function streamCompletion(
   config: LlmConfig,
   prompt: string,
   onToken: (token: string) => Promise<void>,
-): Promise<void> {
-  const client = new OpenAI({ baseURL: config.baseUrl, apiKey: config.apiKey });
-  const stream = await client.chat.completions.create({
-    model: config.model,
-    messages: [{ role: "user", content: prompt }],
-    stream: true,
-  });
-  for await (const chunk of stream) {
-    const delta = chunk.choices[0]?.delta?.content;
-    if (!delta || delta.length === 0) continue; // skip empty deltas
-    await onToken(delta);
-  }
-}
+  options: { continueFrom?: string; signal?: AbortSignal } = {},
+): Promise<void>
 ```
 
-### 6.4 `server/bridge.ts` — Express + WebSocket bridge
+Two additions beyond the original adapter, and both are honest about their
+limits:
+
+- `signal` makes `Cancel` real — the upstream HTTP request is aborted, not just
+  the gRPC stream.
+- `continueFrom` is only used after a server restart, when no live job exists.
+  It re-prompts the model with its own prefix ("continue from exactly where it
+  stops"). That produces *coherent* text but not *identical* text, because
+  sampling is non-deterministic. Same-session resumes never take this path —
+  they re-attach to the job, so the recovered tokens are the real ones.
+
+### 6.5 `server/bridge.ts` — Express + WebSocket bridge
 
 Browsers cannot speak gRPC natively, so the bridge translates WebSocket JSON
 into gRPC calls and forwards tokens back. It also handles browser `ack`
@@ -324,24 +347,35 @@ function sendToBrowser(socket: WebSocket, message: unknown): void {
 }
 ```
 
+On socket close the bridge cancels its outstanding **gRPC calls**, not the
+generation: `browser disconnected (cancelling N call(s); generation continues)`.
+A dead browser must not be a cancelled inference — that is the whole premise.
+
 Browser → bridge messages:
 
 ```json
 { "type": "generate", "prompt": "...", "session_id": "sess_..." }
 { "type": "resume", "session_id": "sess_...", "resume_from_token": 42 }
 { "type": "ack", "session_id": "sess_...", "acked_token_index": 99 }
+{ "type": "cancel", "session_id": "sess_..." }
 ```
 
 Bridge → browser messages:
 
 ```json
-{ "type": "token", "token": "The", "token_index": 0, "is_final": false, "session_id": "sess_..." }
+{ "type": "token", "token": "The", "token_index": 0, "is_final": false, "replayed": false, "session_id": "sess_..." }
 { "type": "journal_state", "session_id": "sess_...", "token_count": 101 }
 { "type": "ack_state", "session_id": "sess_...", "acked_token_index": 99, "journaled_token_count": 2, "first_retained_index": 99 }
-{ "type": "stream_started" | "stream_resumed" | "stream_dropped", ... }
+{ "type": "stream_started" | "stream_resumed" | "stream_dropped", "session_id": "sess_..." }
+{ "type": "resync_required", "session_id": "sess_...", "first_retained_index": 176 }
+{ "type": "cancelled", "session_id": "sess_...", "cancelled_at_token": 88, "was_running": true }
 ```
 
-### 6.5 `client/index.ts` — standalone gRPC CLI client
+`replayed: true` on a token is what the UI flashes yellow. `resync_required`
+is the bridge's translation of `FAILED_PRECONDITION` — the cursor points into a
+trimmed hole, and pretending otherwise would silently drop tokens.
+
+### 6.6 `client/index.ts` — standalone gRPC CLI client
 
 The terminal tool that proves resumption without a browser. It tracks the last
 received `token_index`, sends periodic ACKs (`--ack-every N`), and prints a
@@ -358,7 +392,7 @@ stream.on("data", (response) => {
 // summary: session="demo" last_token_index=41 (resume with --resume-from 42)
 ```
 
-### 6.6 `web/` — the React UI
+### 6.7 `web/` — the React UI
 
 Two panels, raw CSS only:
 
@@ -432,6 +466,13 @@ Open **http://localhost:5173** — the UI should appear.
    climbing, and the terminal logs the server's `STARTING` → `RESUMING` →
    `completed` lifecycle for the session, plus periodic `ack`/`trim` lines as
    the journal drops tokens the client has already confirmed.
+8. **Say the important sentence** — Kill Stream *detaches*; it does not cancel.
+   The server log line `browser disconnected (cancelling N call(s); generation
+   continues)` is the proof, and it is why the resume can replay real tokens
+   instead of re-prompting the model. Stopping the model is a separate,
+   explicit `Cancel` RPC (declared in the proto and implemented in the server and
+   bridge; the UI deliberately does not, because detaching is the behaviour the
+   talk is about).
 
 ### Terminal-only testing (no browser)
 
@@ -463,6 +504,7 @@ error showing `session_id` and the next index to resume from.
 | `GRPC_PORT`          | `50051`                | gRPC server listen port (the bridge targets this by default) |
 | `BRIDGE_PORT`        | `3001`                 | Express + WebSocket bridge port                          |
 | `JOURNAL_TTL_MS`     | `600000`               | Journal TTL — session evicted after this much inactivity |
+| `JOURNAL_DB`         | `.journal.db`          | SQLite mirror so a server restart can still replay. Set empty for memory-only |
 
 Optional overrides: `SERVER_ADDRESS` (explicit gRPC address for the bridge,
 overrides `GRPC_PORT`) and `VITE_PORT` (default `5173`).
@@ -481,40 +523,43 @@ the client renders tokens `0..D-1`, then stays "disconnected" for a gap while
 the server keeps journaling (exactly what the bridge does after a browser
 WebSocket closes), then either **retries** from scratch or **resumes** from D.
 
-Representative run against a real endpoint (drops at 50 / 200 / 400 tokens):
+Representative run against a real endpoint (2 runs per cell, medians; the
+demo prompt produces ~300 tokens, so drop points are 50 / 150 / 250):
 
-| drop after | strategy | reconnect→1st token | reconnect→complete | tokens received | new inference tokens | inference saved |
-|---|----------|-------------------|--------------------|-----------------|----------------------|-----------------|
-| 50 | retry | 13326 ms | 45871 ms | 481 | 431 | — |
-| 50 | resume | 5 ms | 58480 ms | 512 | 454 | — |
-| 200 | retry | 13919 ms | 37024 ms | 583 | 383 | — |
-| 200 | resume | 7 ms | 21417 ms | 654 | 442 | — |
-| 400 | retry | 10116 ms | 29655 ms | 828 | 411 | — |
-| 400 | resume | 8117 ms | 32317 ms | 734 | 380 | −31 |
+| drop after | strategy | reconnect→1st token | reconnect→complete | tokens received | new inference tokens | inference saved | runs |
+|---|----------|-------------------|--------------------|-----------------|----------------------|-----------------|---|
+| 50 | retry | 5537 ms | 8662 ms | 287 | 237 | — | 2 |
+| 50 | resume | **4 ms** | 924 ms | 221 | 76 | 161 saved | 2 |
+| 150 | retry | 14213 ms | 16509 ms | 301 | 148 | — | 2 |
+| 150 | resume | **5 ms** | 772 ms | 244 | 68 | 80 saved | 2 |
+| 250 | retry | 8108 ms | 12195 ms | 433 | 227 | — | 2 |
+| 250 | resume | **5 ms** | 6 ms | 252 | 0 | 227 saved | 2 |
 
 **How to read it (and the honest caveats).**
 
 - **Reconnect→1st token is the decisive, user-visible number.** With *retry*,
-  the client waits for the LLM to re-generate from scratch — 10–14 seconds of
-  dead air on this endpoint. With *resume*, the server replays the journaled
-  gap from memory in **5–7 ms**, so the story continues almost instantly. This
-  is the difference the demo shows live.
-- **Inference tokens are noisy — that is the point of using a real LLM.**
-  Because sampling is non-deterministic, a retry's fresh run can be longer or
-  shorter than the original (431 vs 454 tokens at drop 50), so the "saving"
-  column can be negative or positive run-to-run. At drop 400, resume saved
-  31 tokens of inference; at smaller drops the variance dominates. The mock
-  mode (`--mock`) shows the *deterministic* version where the saving is
-  exactly `D` tokens, which is what a backend with deterministic continuation
-  (e.g. `temperature: 0`) would give you.
-- **The 8 s first-token at drop 400** is a real edge: if the journal was
-  trimmed or the gap outran the journal, resume falls through to fresh
-  inference and pays the LLM's time-to-first-token again. Resume never *loses*
-  data, but its advantage is bounded by what the journal retained.
+  the client sits in dead air while the LLM re-generates from scratch —
+  5.5–14 seconds here. With *resume*, the server replays the journaled tokens
+  from memory in **4–5 ms**. That is the gap the live demo shows.
+- **New inference tokens are what you actually pay for.** Resume only pays for
+  tokens the model produced *after* the client came back — 76, 68 and 0 in the
+  three rows. Retry pays for the entire stream again every time.
+- **The saving grows with how far the stream got**, which is the checkpointing
+  argument: at drop 250 the generation had already finished while the client
+  was away, so resume costs **zero** inference and 6 ms to finish. At drop 50
+  most of the work is still ahead, so resume still runs the model — it just
+  doesn't repeat what was already delivered.
+- **Numbers move run to run** because the backend is a real, sampling LLM: the
+  same prompt yields 280–320 tokens, so retry's fresh run is never exactly the
+  same length. `--mock` shows the deterministic version, where resume's new
+  inference is exactly `stream_length − D`.
+- **Drop points must sit inside the stream.** An earlier pass used 400 and the
+  generation finished before the client ever dropped, so there was nothing to
+  measure. Pick `BENCH_DROPS` below the observed token count.
 
 Run it yourself: `npm run bench` (real) or `npm run bench -- --mock` (mock).
-Tune with `BENCH_DROPS=50,200,400`, `BENCH_GAP_MS=1000`, `BENCH_PROMPT=...`.
-Raw output is saved to `benchmark/results.md`.
+Tune with `BENCH_DROPS=50,150,250`, `BENCH_RUNS=3`, `BENCH_GAP_MS=1000`,
+`BENCH_PROMPT=...`. Raw output is saved to `benchmark/results.md`.
 
 ## 12. Prior art
 
@@ -530,10 +575,13 @@ adjacent mechanisms (HTTP Range, message-queue replay, prompt caching).
   bit-identical *after* the resume point, because the journal replays the exact
   tokens that were produced. If you want identical fresh runs, use
   `temperature: 0` / a fixed seed on your endpoint.
-- **In-memory journal.** The journal lives in server memory; a process restart
-  loses all sessions, and `resume` then falls back to a fresh inference. A
-  production version would persist the journal (append-only log, WAL, or
-  object storage) — the protocol design is unchanged.
+- **In-memory journal (with a SQLite mirror).** The working set is memory; every
+  write is also mirrored into `JOURNAL_DB` so a process restart can replay
+  sessions inside their TTL. Real multi-instance persistence (WAL, Redis, object
+  storage) is still out of scope — the protocol design does not change.
+- **One live follower per session.** `GenerationJob` fans out to a single
+  attached sink. Multiple simultaneous viewers of one generation needs a
+  broadcast queue, which is a bridge concern, not a protocol one.
 - **Single-server scope.** Sessions are pinned to one server process. Resuming
   from a different replica would require a shared journal.
 - **No auth / TLS / Docker.** This is a local demo, not a production service.
@@ -563,14 +611,14 @@ adjacent mechanisms (HTTP Range, message-queue replay, prompt caching).
 
 Here are concrete, valuable additions you could build:
 
-1. **Persistent journal (WAL / SQLite / Redis).** Replace the in-memory map with
-   an append-only log or a store so sessions survive server restarts. This is
-   the single biggest production gap. The protocol is unchanged.
+1. **Shared journal (Redis / object storage).** The in-memory window is mirrored
+   into SQLite, so restarts inside the TTL can replay. Moving it to a shared
+   store would let *any* replica serve a resume — the single biggest production
+   gap. The protocol is unchanged.
 2. **Backpressure-aware replay.** Stream journaled tokens with `await` on each
    `write` so a slow client doesn't buffer unbounded tokens.
-3. **`Cancel` RPC.** Add `Cancel(session_id)` so a user can *actually stop* a
-   generation (vs. Kill Stream which only drops the client). The server would
-   abort the LLM call and finalize the journal.
+3. **Multi-viewer fan-out.** `GenerationJob` currently attaches one sink; give it
+   a set and broadcast, so a second browser can watch a live generation.
 4. **Client-side cursor persistence.** Persist `last_token_index` in
    `localStorage` so a page reload can auto-resume without the server's ACK
    watermark.
@@ -578,9 +626,9 @@ Here are concrete, valuable additions you could build:
    via the request, and route to different endpoints per model.
 6. **Stream statistics.** Expose tokens/sec, TTFT, and latency percentiles via
    the bridge (`stats` message) and render them in the UI.
-7. **Shared-journal multi-replica.** Move the journal behind Redis/etcd so any
-   replica can serve a resume — turning the single-server limitation into a
-   horizontally-scalable design.
+7. **Journal epochs.** Stamp each session with an epoch and a digest of the last
+   N replayed tokens, so a client can prove it is talking to the same journal it
+   left — the failure mode a multi-replica journal makes likely.
 8. **Idempotency / dedup at the client.** Add a message-level dedup key so a
    client that resumes can verify it never double-applies a token.
 9. **AuthN/Z.** Add a simple token check on the bridge WebSocket and gRPC
@@ -602,19 +650,17 @@ dead-reckoning-grpc/
 ├── proto/inference.proto      # the protocol being demonstrated (cursor + ACK)
 ├── server/
 │   ├── index.ts               # gRPC server entry point
-│   ├── handler.ts             # Generate + Ack handlers (shared with bridge)
-│   ├── journal.ts             # token journal with TTL + ACK trimming (the core)
+│   ├── handler.ts             # Generate (attach/replay) + Ack + Cancel
+│   ├── job.ts                 # server-owned generation job (the fix that matters)
+│   ├── journal.ts             # sliding window, ACK trim, TTL, SQLite mirror
 │   ├── llm.ts                 # OpenAI-compatible streaming wrapper
 │   └── bridge.ts              # Express + WebSocket bridge for the browser
 ├── client/index.ts            # standalone gRPC CLI client (cursor + periodic ACKs)
 ├── benchmark/
-│   ├── src/index.ts           # retry-vs-resume benchmark harness
+│   ├── src/index.ts           # retry-vs-resume harness (median of N runs)
 │   └── results.md             # generated comparison table
 ├── docs/
-│   ├── prior-art.md           # prior-art review (gRPC-core / grpc-web / connect)
-│   ├── BLOG.md                # technical blog post
-│   ├── X-THREAD.md            # 2-tweet X thread
-│   └── LINKEDIN.md            # LinkedIn post
+│   └── prior-art.md           # prior-art review (gRPC-core / grpc-web / connect)
 ├── web/src/
 │   ├── App.tsx                # state machine, WebSocket, ACK timer, panels
 │   └── components/

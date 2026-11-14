@@ -135,6 +135,12 @@ export function App(): JSX.Element {
         case "token": {
           if (message.token.length > 0) {
             appendToken({ index: message.token_index, text: message.token });
+            // A token flagged replayed came out of the journal after a resume;
+            // flash it so the audience can see exactly what was recovered
+            // rather than regenerated.
+            if (message.replayed) {
+              flashTokens([message.token_index]);
+            }
           }
           setLastAckIndexRef(message.token_index);
           // The final marker ends the stream: stop the blinking cursor.
@@ -174,6 +180,21 @@ export function App(): JSX.Element {
           pushEvent(`Stream dropped at token ${message.last_token_index}`);
           break;
         }
+        case "resync_required": {
+          // The cursor fell below the journal's retained window (ACK trimming
+          // + TTL). Refuse to fake continuity: the client must start over.
+          setStreamStatus("DROPPED");
+          setConnectionStatus("DISCONNECTED");
+          pushEvent(
+            `Resync required: cursor below journal window (first retained ${message.first_retained_index})`,
+          );
+          break;
+        }
+        case "cancelled": {
+          setStreamStatus("IDLE");
+          pushEvent(`Cancelled at token ${message.cancelled_at_token}`);
+          break;
+        }
         default: {
           // Exhaustiveness guard: unknown message types are ignored.
           const never: never = message;
@@ -181,7 +202,7 @@ export function App(): JSX.Element {
         }
       }
     },
-    [appendToken, journalTokens, pushEvent, setLastAckIndexRef],
+    [appendToken, flashTokens, journalTokens, pushEvent, setLastAckIndexRef],
   );
 
   /** Open a fresh WebSocket to the bridge and wire up its handlers. */
@@ -308,8 +329,9 @@ export function App(): JSX.Element {
       <header className="app-header">
         <h1>Dead Reckoning</h1>
         <p className="tagline">
-          Resumable gRPC server-streaming for LLM inference — replay from the
-          journal, never re-run the model.
+          Resumable gRPC server-streaming for LLM inference. The call drops, the
+          model keeps writing to the journal, and the reconnect replays from your
+          last confirmed token.
         </p>
       </header>
       <main className="panels">

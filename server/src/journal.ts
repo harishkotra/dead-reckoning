@@ -18,9 +18,14 @@
 // memory without bound; TTL eviction (10 minutes of inactivity, configurable
 // via JOURNAL_TTL_MS, swept every 60s) drops whole idle sessions.
 //
-// Storage is in-memory only for this version. Every write, ack, trim and
-// eviction is logged to stdout with a timestamp prefix.
+// Persistence: the journal is mirrored to SQLite via node:sqlite (built into
+// Node, so no dependency and no native build step). That is what makes the
+// strongest version of the demo true — kill the SERVER mid-stream, restart it,
+// and the reconnect still replays the journal instead of regenerating. Pass no
+// db path to get the original in-memory-only behaviour. Every write, ack, trim
+// and eviction is logged to stdout with a timestamp prefix.
 
+import { createRequire } from "node:module";
 import { setInterval, clearInterval } from "node:timers";
 
 /** A single journaled session: a sliding window of tokens produced so far. */
@@ -31,10 +36,24 @@ interface JournalEntry {
   base_index: number;
   /** Highest token index the client has confirmed via Ack (-1 if none yet). */
   acked_index: number;
+  /** Last token index of a completed run, or -1 while generation is unfinished. */
+  final_index: number;
+  /** The prompt the session was created with (needed to continue after a restart). */
+  prompt: string;
   /** Epoch ms when the session was first created. */
   created_at: number;
   /** Epoch ms of the most recent read or write — drives TTL eviction. */
   last_accessed: number;
+}
+
+/** The slice of node:sqlite the journal uses. Typed locally to avoid depending on @types/node. */
+interface SqlStatement {
+  run(...params: unknown[]): unknown;
+  all(...params: unknown[]): unknown[];
+}
+interface SqlDb {
+  exec(sql: string): void;
+  prepare(sql: string): SqlStatement;
 }
 
 const TTL_SWEEP_INTERVAL_MS = 60_000;
@@ -47,18 +66,112 @@ function log(message: string): void {
   process.stdout.write(`[${new Date().toISOString()}] [journal] ${message}\n`);
 }
 
+/**
+ * Open the SQLite journal. Returns null (memory-only mode) when node:sqlite is
+ * unavailable, so a missing runtime feature degrades instead of crashing.
+ */
+function openDb(path: string): SqlDb | null {
+  try {
+    const require = createRequire(import.meta.url);
+    const { DatabaseSync } = require("node:sqlite") as { DatabaseSync: new (p: string) => SqlDb };
+    return new DatabaseSync(path);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(`persistence disabled (${message}); journal is memory-only`);
+    return null;
+  }
+}
+
 export class TokenJournal {
   private readonly sessions = new Map<string, JournalEntry>();
   private readonly ttlMs: number;
   private readonly sweepTimer: ReturnType<typeof setInterval>;
+  private readonly db: SqlDb | null;
 
-  constructor(ttlMs: number) {
+  constructor(ttlMs: number, dbPath?: string) {
     this.ttlMs = ttlMs;
-    log(`initialized with TTL ${ttlMs}ms (sweep every ${TTL_SWEEP_INTERVAL_MS}ms)`);
+    this.db = dbPath ? openDb(dbPath) : null;
+    if (this.db) {
+      this.db.exec(
+        `CREATE TABLE IF NOT EXISTS sessions (
+           session_id TEXT PRIMARY KEY,
+           prompt TEXT NOT NULL DEFAULT '',
+           acked_index INTEGER NOT NULL DEFAULT -1,
+           base_index INTEGER NOT NULL DEFAULT 0,
+           final_index INTEGER NOT NULL DEFAULT -1,
+           created_at INTEGER NOT NULL,
+           last_accessed INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS tokens (
+           session_id TEXT NOT NULL,
+           idx INTEGER NOT NULL,
+           token TEXT NOT NULL,
+           PRIMARY KEY (session_id, idx)
+         );`,
+      );
+      this.load();
+    }
+    log(
+      `initialized with TTL ${ttlMs}ms (sweep every ${TTL_SWEEP_INTERVAL_MS}ms, ` +
+        `${this.db ? `persistence at ${dbPath}` : "memory-only"})`,
+    );
     // Sweep expired sessions periodically. Unref'd so it never keeps the
     // process alive on its own.
     this.sweepTimer = setInterval(() => this.evict(), TTL_SWEEP_INTERVAL_MS);
     this.sweepTimer.unref();
+  }
+
+  /** Rehydrate sessions and their retained tokens from SQLite at startup. */
+  private load(): void {
+    if (!this.db) {
+      return;
+    }
+    const rows = this.db.prepare("SELECT * FROM sessions").all() as Array<Record<string, unknown>>;
+    for (const row of rows) {
+      const session_id = String(row.session_id);
+      const base_index = Number(row.base_index);
+      const tokens = (this.db.prepare("SELECT idx, token FROM tokens WHERE session_id = ? ORDER BY idx").all(session_id) as Array<
+        Record<string, unknown>
+      >).map((t) => [Number(t.idx), String(t.token)] as const);
+      const entry: JournalEntry = {
+        tokens: [],
+        base_index,
+        acked_index: Number(row.acked_index),
+        final_index: Number(row.final_index),
+        prompt: String(row.prompt ?? ""),
+        created_at: Number(row.created_at),
+        last_accessed: Number(row.last_accessed),
+      };
+      for (const [idx, token] of tokens) {
+        while (entry.tokens.length <= idx - base_index) {
+          entry.tokens.push("");
+        }
+        entry.tokens[idx - base_index] = token;
+      }
+      this.sessions.set(session_id, entry);
+    }
+    if (rows.length > 0) {
+      log(`rehydrated ${rows.length} session(s) from disk`);
+    }
+  }
+
+  /** Mirror one session's metadata to disk. */
+  private persistSession(session_id: string, entry: JournalEntry): void {
+    if (!this.db) {
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO sessions (session_id, prompt, acked_index, base_index, final_index, created_at, last_accessed)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET
+           prompt = excluded.prompt,
+           acked_index = excluded.acked_index,
+           base_index = excluded.base_index,
+           final_index = excluded.final_index,
+           last_accessed = excluded.last_accessed`,
+      )
+      .run(session_id, entry.prompt, entry.acked_index, entry.base_index, entry.final_index, entry.created_at, entry.last_accessed);
   }
 
   /**
@@ -73,6 +186,8 @@ export class TokenJournal {
         tokens: [],
         base_index: 0,
         acked_index: -1,
+        final_index: -1,
+        prompt: "",
         created_at: Date.now(),
         last_accessed: Date.now(),
       };
@@ -86,13 +201,42 @@ export class TokenJournal {
     }
     entry.tokens[token_index - entry.base_index] = token;
     entry.last_accessed = Date.now();
+    if (this.db) {
+      this.db.prepare("INSERT OR REPLACE INTO tokens (session_id, idx, token) VALUES (?, ?, ?)").run(session_id, token_index, token);
+      this.persistSession(session_id, entry);
+    }
     log(`write session="${session_id}" index=${token_index} token=${JSON.stringify(token)}`);
+  }
+
+  /** Record the prompt a session was started with (persisted for post-restart continuation). */
+  setPrompt(session_id: string, prompt: string): void {
+    const entry = this.sessions.get(session_id);
+    if (entry) {
+      entry.prompt = prompt;
+      this.persistSession(session_id, entry);
+    }
+  }
+
+  /** The prompt a session was started with ("" if unknown). */
+  prompt(session_id: string): string {
+    return this.sessions.get(session_id)?.prompt ?? "";
+  }
+
+  /**
+   * The tail of a session's journal as text — what a continuation prompt is
+   * built from when the process that owned the run is gone.
+   */
+  text(session_id: string, maxChars: number): string {
+    const tokens = this.sessions.get(session_id)?.tokens ?? [];
+    return tokens.join("").slice(-maxChars);
   }
 
   /**
    * Return every token from from_index onward (absolute indices). Returns an
    * empty array when the session does not exist, from_index is beyond the end
-   * of the journal, or from_index has already been ACK-trimmed away.
+   * of the journal, or from_index has already been ACK-trimmed away. Callers
+   * that must distinguish "nothing to replay" from "cursor fell out of the
+   * window" check firstIndex() first.
    */
   read(session_id: string, from_index: number): string[] {
     const entry = this.sessions.get(session_id);
@@ -140,6 +284,22 @@ export class TokenJournal {
     return entry.base_index;
   }
 
+  /** Mark a session's run as complete at final_index, so resumes replay and stop. */
+  markFinal(session_id: string, final_index: number): void {
+    const entry = this.sessions.get(session_id);
+    if (!entry) {
+      return;
+    }
+    entry.final_index = final_index;
+    this.persistSession(session_id, entry);
+    log(`session "${session_id}" marked final at token ${final_index}`);
+  }
+
+  /** Last index of a completed run, or -1 if the run never finished. */
+  finalIndex(session_id: string): number {
+    return this.sessions.get(session_id)?.final_index ?? -1;
+  }
+
   /**
    * Record the client's confirmed watermark and trim journaled tokens the
    * client no longer needs. acked_index is the index of the LAST token the
@@ -170,11 +330,15 @@ export class TokenJournal {
     if (dropCount > 0) {
       entry.tokens.splice(0, dropCount);
       entry.base_index += dropCount;
+      if (this.db) {
+        this.db.prepare("DELETE FROM tokens WHERE session_id = ? AND idx <= ?").run(session_id, trimUpTo);
+      }
       log(
         `trim session="${session_id}" dropped ${dropCount} token(s); ` +
           `window=[${entry.base_index}..${this.lastIndex(session_id)}] retained=${entry.tokens.length}`,
       );
     }
+    this.persistSession(session_id, entry);
     return {
       acked_index: entry.acked_index,
       journaled_token_count: entry.tokens.length,
@@ -192,6 +356,10 @@ export class TokenJournal {
     for (const [session_id, entry] of this.sessions) {
       if (now - entry.last_accessed > this.ttlMs) {
         this.sessions.delete(session_id);
+        if (this.db) {
+          this.db.prepare("DELETE FROM tokens WHERE session_id = ?").run(session_id);
+          this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(session_id);
+        }
         evicted += 1;
         log(
           `evicted session="${session_id}" (${entry.tokens.length} tokens retained, ` +

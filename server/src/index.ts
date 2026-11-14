@@ -11,6 +11,12 @@
 // Entry point dispatch: `npm run dev:server` runs this as the gRPC server;
 // `npm run dev:bridge -- --bridge` runs server/bridge.ts instead (the browser
 // bridge). Both share this workspace's dependencies.
+//
+// JOURNAL_DB: path to the SQLite journal (default `.journal.db` via .env; set
+// to empty to run memory-only). JOURNAL_TTL_MS: idle-session TTL, i.e. how long
+// a dropped stream stays resumable — the number the talk's "sizing the journal
+// TTL" slide is about: it must exceed the longest plausible client outage, and
+// it is bounded by the cost of holding tokens.
 
 import * as dotenv from "dotenv";
 import * as grpc from "@grpc/grpc-js";
@@ -40,15 +46,15 @@ function loadPort(): number {
 function startGrpcServer(): void {
   const port = loadPort();
   const ttlMs = Number.parseInt(process.env.JOURNAL_TTL_MS ?? "600000", 10);
-  const journal = new TokenJournal(Number.isNaN(ttlMs) ? 600000 : ttlMs);
+  const journal = new TokenJournal(
+    Number.isNaN(ttlMs) ? 600000 : ttlMs,
+    process.env.JOURNAL_DB ?? "",
+  );
 
   const { service } = loadInferenceProto();
-  // session_id -> original prompt, so a prompt-less resume (from the browser
-  // bridge) can continue fresh inference after replaying the journal.
-  const prompts = new Map<string, string>();
 
   const server = new grpc.Server();
-  server.addService(service, makeServiceImplementation(journal, prompts));
+  server.addService(service, makeServiceImplementation(journal));
 
   server.bindAsync(`0.0.0.0:${port}`, grpc.ServerCredentials.createInsecure(), (error, boundPort) => {
     if (error) {

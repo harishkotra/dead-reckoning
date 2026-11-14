@@ -8,8 +8,14 @@
 // token_index (its "dead reckoning" position in the stream). When a stream
 // drops, the client reconnects and asks the server to resume from that index.
 // The server replays the already-generated tokens from its journal, then
-// continues streaming new tokens — so the client never sees a gap or a
-// duplicated token, and inference is never re-run.
+// continues streaming live tokens from the SAME run — so the client never sees
+// a gap, a duplicated token, or a second completion.
+//
+// Ownership model: generation belongs to a SESSION, not to a call. Generate
+// attaches the caller to the session's generation job; if the call dies, the
+// job keeps producing tokens into the journal. That is why resumption is a
+// checkpointing problem (replay from a journal), not a retry problem (re-run
+// the model): the dropped call was only ever a listener.
 //
 // ACKs (added for the conference talk): during a long stream the client
 // periodically confirms its position with Ack(session_id, acked_token_index).
@@ -23,10 +29,14 @@ syntax = "proto3";
 package inference;
 
 service InferenceService {
-  // Generate streams tokens for a prompt. If resume_from_token > 0 and the
-  // session exists in the server's journal, the stream starts by replaying
-  // already-generated tokens from that index onward, then continues with
-  // fresh tokens from the LLM. Otherwise a fresh inference is started.
+  // Generate attaches the caller to a session's generation job.
+  //   - session unknown            -> start a job, stream from token 0
+  //   - resume_from_token >= head  -> replay the journal from that index, then
+  //                                   stream live tokens from the same job
+  //   - resume_from_token < head   -> FAILED_PRECONDITION with the first
+  //                                   retained index in trailing metadata. The
+  //                                   client must resync rather than silently
+  //                                   accept a gap.
   rpc Generate(GenerateRequest) returns (stream GenerateResponse);
 
   // Ack records the client's confirmed watermark for a session. The server
@@ -34,11 +44,18 @@ service InferenceService {
   // state-recovery queries (a client that lost its local cursor can learn the
   // last index it confirmed).
   rpc Ack(AckRequest) returns (AckResponse);
+
+  // Cancel ends a session's generation job and frees the upstream inference.
+  // A dropped call is a detach, not a cancel: only this stops the model.
+  // Idempotent — cancelling a completed or unknown session is not an error.
+  rpc Cancel(CancelRequest) returns (CancelResponse);
 }
 
 message GenerateRequest {
   string prompt = 1;
+  // Required. Identifies the generation job; a resume must reuse the same id.
   string session_id = 2;
+  // Index AFTER the last token the client has fully received.
   int32 resume_from_token = 3;
 }
 
@@ -46,6 +63,9 @@ message GenerateResponse {
   string token = 1;
   int32 token_index = 2;
   bool is_final = 3;
+  // True when this token came from the journal rather than the model. Lets a
+  // client (and the benchmark) separate replayed tokens from live ones.
+  bool replayed = 4;
 }
 
 message AckRequest {
@@ -61,4 +81,16 @@ message AckResponse {
   int32 journaled_token_count = 3;
   // Index of the first token still retained in the journal (0 if none).
   int32 first_retained_index = 4;
+}
+
+message CancelRequest {
+  string session_id = 1;
+}
+
+message CancelResponse {
+  string session_id = 1;
+  // Last token index journaled before cancellation (-1 if unknown session).
+  int32 cancelled_at_token = 2;
+  // False when the session had already finished or never existed.
+  bool was_running = 3;
 }
