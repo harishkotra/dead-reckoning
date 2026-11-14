@@ -553,9 +553,12 @@ demo prompt produces ~300 tokens, so drop points are 50 / 150 / 250):
   same prompt yields 280–320 tokens, so retry's fresh run is never exactly the
   same length. `--mock` shows the deterministic version, where resume's new
   inference is exactly `stream_length − D`.
-- **Drop points must sit inside the stream.** An earlier pass used 400 and the
-  generation finished before the client ever dropped, so there was nothing to
-  measure. Pick `BENCH_DROPS` below the observed token count.
+- **Drop points must sit inside the stream.** In an earlier pass with
+  `BENCH_DROPS=50,200,400` the generation finished (120–300 tokens) before the
+  client reached 400, so nothing was interrupted: the "resume" row became a
+  full replay of an already-complete run, which flatters the numbers. Keep
+  `BENCH_DROPS` below the observed token count and check the log for a
+  `job finished` line *after* the drop.
 
 Run it yourself: `npm run bench` (real) or `npm run bench -- --mock` (mock).
 Tune with `BENCH_DROPS=50,150,250`, `BENCH_RUNS=3`, `BENCH_GAP_MS=1000`,
